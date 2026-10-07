@@ -1,0 +1,9 @@
+services:
+  radiko-relay:
+    build: .
+    container_name: radiko-relay
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    environment:
+      BITRATE: "128k"
