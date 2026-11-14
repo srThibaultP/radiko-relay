@@ -1,5 +1,6 @@
 services:
   radiko-relay:
+    image: ghcr.io/srthibaultp/radiko-relay:latest
     build: .
     container_name: radiko-relay
     restart: unless-stopped
