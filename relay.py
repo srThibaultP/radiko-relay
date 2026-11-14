@@ -1,12 +1,27 @@
 #!/usr/bin/env python3
 """radiko -> plain HTTP MP3 relay. GET /<STATION_ID>.mp3 (e.g. /FMJ.mp3 for J-WAVE).
 ffmpeg runs only while at least one client listens; token is renewed on every start."""
-import base64, hashlib, os, random, subprocess, threading, time, urllib.request
+import base64, collections, hashlib, os, random, subprocess, threading, time, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 AUTHKEY = "bcd151073c03b352e1ef2fd66c32209da9ca0afa"  # public pc_html5 key
 UA = "Mozilla/5.0"
 BITRATE = os.environ.get("BITRATE", "128k")
+# Per-client buffer cap, in 4 KiB chunks (1024 = 4 MiB, ~4 min of 128k MP3).
+# A client that falls further behind (stalled player, half-dead TCP) is dropped
+# instead of buffering forever: an unbounded list here leaked ~1.4 GB/day.
+MAX_CHUNKS = int(os.environ.get("MAX_CHUNKS", "1024"))
+WRITE_TIMEOUT = 30  # seconds a socket write may block before the client is dropped
+
+class Client:
+    def __init__(self):
+        self.buf, self.dead, self.ev = collections.deque(), False, threading.Event()
+    def push(self, chunk):
+        if self.dead: return
+        if len(self.buf) >= MAX_CHUNKS:
+            self.dead = True; self.buf.clear(); print("client too slow, dropping", flush=True)
+        else: self.buf.append(chunk)
+        self.ev.set()
 
 def auth():
     h = {"X-Radiko-App": "pc_html5", "X-Radiko-App-Version": "0.0.1",
@@ -70,16 +85,19 @@ class Station:
         while True:
             chunk = proc.stdout.read(4096)
             if not chunk: break
-            for q in list(self.clients):
-                try: q.append(chunk)
-                except Exception: pass
+            for c in list(self.clients):
+                c.push(chunk)
         proc.wait()
 
     def attach(self, q):
         with self.lock:
             self.clients.append(q)
             if not self.proc or self.proc.poll() is not None:
-                self.start()
+                try: self.start()
+                except Exception:
+                    # Without this, a failed start (radiko TLS timeout) left a ghost
+                    # client that kept ffmpeg running and buffered forever.
+                    self.clients.remove(q); raise
 
     def detach(self, q):
         with self.lock:
@@ -104,7 +122,7 @@ class H(BaseHTTPRequestHandler):
         if not sid.replace("-", "").isalnum():
             self.send_error(404); return
         with slock: st = stations.setdefault(sid, Station(sid))
-        q = []
+        q = Client()
         try: st.attach(q)
         except Exception as e:
             print("attach failed:", e, flush=True); self.send_error(502); return
@@ -113,15 +131,17 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.send_header("icy-name", f"radiko {sid}")
         self.end_headers()
+        self.connection.settimeout(WRITE_TIMEOUT)
         try:
             last = time.time()
-            while True:
-                if q:
-                    self.wfile.write(q.pop(0)); last = time.time()
+            while not q.dead:
+                if q.buf:
+                    self.wfile.write(q.buf.popleft()); last = time.time()
                 else:
                     if time.time() - last > 30 or (st.proc and st.proc.poll() is not None): break
-                    time.sleep(0.02)
-        except Exception: pass
+                    q.ev.clear()
+                    if not q.buf: q.ev.wait(1)
+        except Exception as e: print("client gone:", self.client_address[0], sid, e, flush=True)
         finally: st.detach(q)
     def log_message(self, fmt, *a): print('req', self.client_address[0], fmt % a, self.headers.get('User-Agent'), flush=True)
 

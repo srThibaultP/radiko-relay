@@ -7,3 +7,7 @@ services:
       - "8765:8765"
     environment:
       BITRATE: "128k"
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
